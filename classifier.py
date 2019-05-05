@@ -189,7 +189,7 @@ def create_data(texts=None, dict_name='train_texts'):
     make_dict(params, d, texts_name=dict_name)
     print(len(params['dict']), "words in texts found")
 
-    cut_dict = {key: val for key, val in params[d].items() if val > 5}
+    cut_dict = {key: val for key, val in params[d].items() if val > 4}
     print('after cut: ', len(cut_dict))
 
     params[d] = cut_dict
@@ -238,20 +238,20 @@ class Graph:
             with tf.variable_scope('word_emb', reuse=reuse_vars):
                 self.word_emb = tf.get_variable(name='word_embs',
                                                 shape=[self.voc_size, self.emb_size],
-                                                initializer=tf.truncated_normal_initializer(
-                                                    stddev=1.0 / (self.emb_size ** 0.5)))
-            if reuse_vars:  # for restoring model!!!
-                self.doc_emb = tf.get_variable(
-                    shape=[self.doc_num, self.emb_size],
-                    initializer=tf.truncated_normal_initializer(stddev=1.0 / (self.emb_size ** 0.5)),
-                    name='doc_embs'
-                )
-            else:
-                self.doc_emb = tf.Variable(
-                    tf.truncated_normal(shape=[self.doc_num, self.emb_size],
-                                        stddev=1.0 / (self.emb_size ** 0.5)),
-                    name='doc_embs'
-                )
+                                                initializer=tf.random_uniform_initializer(-1/self.emb_size, 1/self.emb_size))
+            # if reuse_vars:  # for restoring model!!!
+            #     self.doc_emb = tf.get_variable(
+            #         shape=[self.doc_num, self.emb_size],
+            #         initializer=tf.truncated_normal_initializer(stddev=1.0 / (self.emb_size ** 0.5)),
+            #         name='doc_embs'
+            #     )
+            # else:
+            self.doc_emb = tf.Variable(
+                tf.random_uniform(shape=[self.doc_num, self.emb_size],
+                                  minval=-1/self.emb_size,
+                                  maxval=1/self.emb_size),
+                name='doc_embs'
+            )
 
         print(self.doc_emb.name, self.word_emb.name)
 
@@ -281,7 +281,11 @@ class Graph:
     def _create_optimizer(self):
         with tf.name_scope('optimizer'):
             self.optimizer = tf.train.GradientDescentOptimizer(learning_rate=self.ph_lr,
-                                                               name='grad_descent').minimize(self.loss_sc)
+                                                               name='grad_descent_all').minimize(self.loss_sc)
+
+            self.optimize_only_doc_emb = tf.train.GradientDescentOptimizer(learning_rate=self.ph_lr,
+                                                               			   name='grad_descent_doc').minimize(self.loss_sc, var_list=[self.doc_emb])
+
 
     def _create_summary(self):
         with tf.name_scope('summary'):
@@ -381,15 +385,26 @@ class DvNgramModel:
         # TODO: think about epochs
         # TODO: check word_emb_mat!!!
         # self.num_epochs
-        num_epochs = 3_000_000 // ((data_dict['num_tokens'] // self.batch_size) * (self.k + 1)) + 1
-        print((data_dict['num_tokens'] // self.batch_size), ((data_dict['num_tokens'] // self.batch_size) * (self.k + 1)))
-        # num_epochs = max(2, round(doc_num / self.train_doc_num * 5))
-        print(num_epochs)
+        if doc_num > 20_000:
+            num_epochs = 10
+        if doc_num < 15_000:
+            num_epochs = 15
+            self.lr = 0.001
+        # num_epochs = 3_000_000 // ((data_dict['num_tokens'] // self.batch_size) * (self.k + 1)) + 1
+        # print((data_dict['num_tokens'] // self.batch_size), ((data_dict['num_tokens'] // self.batch_size) * (self.k + 1)))
+        # # num_epochs = max(2, round(doc_num / self.train_doc_num * 5))
+        # if num_epochs > 100:
+        #     num_epochs = 5
+        #     self.lr = self.lr / 5
+
+        print(num_epochs, doc_num)
+        # num_epochs = 0
         word_emb_mat, doc_emb_mat = \
             self.run_graph(graph=self.graphs[-1],
                            num_epochs=num_epochs,
                            data_dict=data_dict,
-                           model_name=model_name)
+                           model_name=model_name,
+                           use_frozen_doc_emb=True)
 
         # TODO: update text2id!!! find on internet how to concat two dicts.
         # self.params['text2id'] = {text: ind for ind, text in enumerate(self.params['train_texts'])}
@@ -404,27 +419,31 @@ class DvNgramModel:
                                                            num_epochs=num_epochs,
                                                            data_dict=self.train_data_dict,
                                                            model_name=model_name,
-                                                           try_restore_model=True)
+                                                           try_restore_model=False)
 
     def run_graph(self,
                   graph,
                   num_epochs,
                   data_dict,
                   model_name='./dvngram_model_4',
-                  try_restore_model=False):
+                  try_restore_model=False,
+                  use_frozen_doc_emb=False):
 
         config = tf.ConfigProto()
         config.gpu_options.allow_growth = True
 
-        saver = tf.train.Saver(max_to_keep=2)
+        saver = tf.train.Saver(max_to_keep=1)
         start = timer()
 
         docs = data_dict['docs']
         ngrams = data_dict['ngrams']
         num_tokens = data_dict['num_tokens']
 
-        new_graph = tf.get_default_graph()
         num_batches = num_tokens // self.batch_size
+
+        new_graph = tf.get_default_graph()
+        # optim = graph.optimizer
+
         if try_restore_model:
             new_graph = tf.Graph()
 
@@ -446,8 +465,21 @@ class DvNgramModel:
             sess.run(tf.global_variables_initializer())
             train_writer = tf.summary.FileWriter(model_name + '/summaries%s' % time_str(), sess.graph)
             step = 0
+            lr = self.lr
+            is_lr_cut = True  # don't use a lot of this 
+            thresh = round(num_epochs * 0.7)
+            print(thresh)
             for i in range(num_epochs):
                 total_loss = 0
+                if i > thresh and not is_lr_cut:
+                    lr = lr / 2
+                    is_lr_cut = True
+
+                if use_frozen_doc_emb and i < num_epochs - 5:
+                    optim = graph.optimize_only_doc_emb
+                else:
+                    optim = graph.optimizer
+
                 with tqdm(total=num_batches * (self.k + 1)) as p:
                     batches = gen_batch(docs,
                                         ngrams,
@@ -458,9 +490,9 @@ class DvNgramModel:
 
                     for ph1, ph2, ph3 in batches:
                         _ = sess.run(
-                            graph.optimizer,
+                            optim,
                             feed_dict={
-                                graph.ph_lr: self.lr,
+                                graph.ph_lr: lr,
                                 graph.ph_docs: ph1,
                                 graph.ph_ngram: ph2,
                                 graph.ph_ngram_in_d: ph3
@@ -471,7 +503,7 @@ class DvNgramModel:
                             summary, l = sess.run(
                                 [graph.summ_loss, graph.loss_sc],
                                 feed_dict={
-                                    graph.ph_lr: self.lr,
+                                    graph.ph_lr: lr,
                                     graph.ph_docs: ph1,
                                     graph.ph_ngram: ph2,
                                     graph.ph_ngram_in_d: ph3
@@ -505,7 +537,7 @@ def pretrain(texts):
                            k=5,
                            lr=0.05)
 
-    n_model.train(num_epochs=0, train_texts=params['texts'], model_name='dvngram_model_train')
+    n_model.train(num_epochs=8, train_texts=params['texts'], model_name='dvngram_model_train')
     return n_model
 
 
